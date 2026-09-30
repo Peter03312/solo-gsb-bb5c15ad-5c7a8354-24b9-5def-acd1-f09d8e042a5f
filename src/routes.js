@@ -4,6 +4,7 @@ const express = require('express');
 const { getDb } = require('./db');
 const { parseClaimDate, claimInterval, formatClaimDate } = require('./dates');
 const { evaluateDraft, publishVersion, latestVersionNo, getVersionDetail, getVersionSummary } = require('./publish');
+const { buildRestorePreview, restoreDraftFromVersion, draftRevisionNo } = require('./restore');
 
 const router = express.Router();
 
@@ -130,6 +131,7 @@ router.get('/api/editor/state', (req, res) => {
   res.json({
     currentVersionNo: latestVersionNo(),
     currentVersion: getVersionSummary(latestVersionNo()) || null,
+    draftRevisionNo: draftRevisionNo(),
     events,
     relations,
   });
@@ -294,6 +296,35 @@ router.get('/api/editor/versions', (req, res) => {
     )
     .all();
   res.json({ currentVersionNo: no, versions: rows });
+});
+
+// ---- 从已发布版本恢复草稿：只读预览，不改数据 ----
+// 列出该版事件、被选时间主张、先于关系，以及当前草稿将被替换的内容。
+router.get('/api/editor/restore-preview/:no', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('版本号必须是正整数');
+  const preview = buildRestorePreview(no);
+  if (!preview) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
+  res.json({ ok: true, ...preview });
+});
+
+// ---- 确认恢复：原子替换整个草稿 ----
+// 必须提交预览时的草稿修订号 draftRevisionNo 与最新版本号 currentVersionNo。
+router.post('/api/editor/restore', (req, res) => {
+  const versionNo = Number(req.body && req.body.versionNo);
+  if (!Number.isInteger(versionNo) || versionNo < 1) {
+    throw badRequest('versionNo 必须是正整数');
+  }
+  const expectedRevision = Number(req.body && req.body.draftRevisionNo);
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+    throw badRequest('draftRevisionNo 必须是非负整数（取预览时返回的值）');
+  }
+  const expectedLatestVersionNo = Number(req.body && req.body.currentVersionNo);
+  if (!Number.isInteger(expectedLatestVersionNo) || expectedLatestVersionNo < 0) {
+    throw badRequest('currentVersionNo 必须是非负整数（取预览时返回的值）');
+  }
+  const result = restoreDraftFromVersion({ versionNo, expectedRevision, expectedLatestVersionNo });
+  res.status(200).json({ ok: true, ...result });
 });
 
 module.exports = router;

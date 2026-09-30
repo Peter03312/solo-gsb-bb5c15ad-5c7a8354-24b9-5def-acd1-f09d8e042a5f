@@ -47,6 +47,34 @@ CREATE TABLE IF NOT EXISTS relations (
 CREATE INDEX IF NOT EXISTS idx_rel_earlier ON relations(earlier_id);
 CREATE INDEX IF NOT EXISTS idx_rel_later ON relations(later_id);
 
+-- ============ 草稿修订号（恢复草稿时的乐观并发控制） ============
+-- 草稿区 events/claims/relations 的任何增删改都由触发器推进 revision；
+-- 「预览恢复」与「确认恢复」之间草稿若被改过，确认即报冲突、不改数据。
+CREATE TABLE IF NOT EXISTS draft_meta (
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  revision INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO draft_meta (id, revision) VALUES (1, 0);
+
+CREATE TRIGGER IF NOT EXISTS trg_events_rev_ai AFTER INSERT ON events
+BEGIN UPDATE draft_meta SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS trg_events_rev_au AFTER UPDATE ON events
+BEGIN UPDATE draft_meta SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS trg_events_rev_ad AFTER DELETE ON events
+BEGIN UPDATE draft_meta SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS trg_claims_rev_ai AFTER INSERT ON claims
+BEGIN UPDATE draft_meta SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS trg_claims_rev_au AFTER UPDATE ON claims
+BEGIN UPDATE draft_meta SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS trg_claims_rev_ad AFTER DELETE ON claims
+BEGIN UPDATE draft_meta SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS trg_relations_rev_ai AFTER INSERT ON relations
+BEGIN UPDATE draft_meta SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS trg_relations_rev_au AFTER UPDATE ON relations
+BEGIN UPDATE draft_meta SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS trg_relations_rev_ad AFTER DELETE ON relations
+BEGIN UPDATE draft_meta SET revision = revision + 1 WHERE id = 1; END;
+
 -- ============ 发布区（不可变版本快照） ============
 CREATE TABLE IF NOT EXISTS versions (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,

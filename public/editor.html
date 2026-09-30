@@ -75,6 +75,7 @@
 
         <div class="card">
           <h2>已发布版本</h2>
+          <p class="muted">历史快照不可变。可从任一已发布版本<b>预览并恢复草稿</b>：原子替换当前草稿（只带回该版被选主张），历史快照与访客年表不受影响；恢复后仍需校验、发布才会公开。</p>
           <div id="versionList" class="muted">加载中…</div>
         </div>
       </section>
@@ -88,6 +89,16 @@
     <div class="d-foot">
       <button class="secondary" id="conflictCancel" type="button">取消，稍后处理</button>
       <button id="conflictReload" type="button">刷新到最新版本并重新确认选择</button>
+    </div>
+  </dialog>
+
+  <!-- 从历史版本恢复草稿对话框 -->
+  <dialog id="restoreDialog">
+    <div class="d-head" style="background:var(--warn-bg)">↩ 预览并从已发布版本恢复草稿</div>
+    <div class="d-body" id="restoreBody">加载预览中…</div>
+    <div class="d-foot">
+      <button class="secondary" id="restoreCancel" type="button">取消</button>
+      <button id="restoreConfirm" type="button">确认：用该版替换当前草稿</button>
     </div>
   </dialog>
 

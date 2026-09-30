@@ -86,6 +86,26 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 
 发布成功后得到递增版本号（第 1 版、第 2 版……），事件、所选主张（精度、区间、出处、考异）、关系与求解日期全部**复制进版本快照**；此后修改草稿不影响任何旧版本。访客页只展示当前最新版本。
 
+### 从历史版本恢复草稿（预览 → 确认）
+
+编辑台右侧「已发布版本」中，每个版本都有「预览并恢复草稿」按钮。恢复**不产生新版本、不改动任何历史快照**，只替换草稿区：
+
+1. **预览（只读）**：弹窗双栏列出——
+   - 该版的事件、每个事件在**当版被选的那一条时间主张**（精度、区间、出处、考异）、全部「先于」关系；
+   - 当前草稿中将被替换掉的全部事件（含未选主张）与关系，以及草稿修订号、最新版本号。
+   预览不写任何数据。
+2. **确认恢复**：请求必须提交预览时返回的**草稿修订号**与**最新版本号**。确认成功时系统在一个事务内**原子替换整个草稿**：清空当前草稿的事件 / 主张 / 关系，按该版快照重建，并**只恢复当版被选的主张**（同一事件其它未选主张不恢复）。返回：
+   - 旧快照 id → 新草稿 id 的映射（事件、主张、关系）；
+   - 每事件一条的**待选主张**，编辑台据此自动填好单选；
+   - 新草稿修订号（每次恢复只推进一次修订号）。
+3. **冲突保护**：确认前若草稿被任何人增删改过（修订号变化），或期间发布了更新的版本（最新版本号变化），返回 **409**（`DRAFT_REVISION_CONFLICT` / `VERSION_CONFLICT`）且**不改动任何数据**，需重新预览再确认；目标版本不存在返回 404。
+
+草稿的任何增、删、改都会推进草稿修订号（含恢复本身）。恢复后：
+
+- **历史快照与访客年表保持不变**（访客仍看当前最新发布版）；
+- 草稿仅含该版内容，仍需「校验能否发布」后正式发布才会公开；
+- 发布仍遵守现有编辑口令、求解校验与 `baseVersionNo` 冲突约定——恢复的是更旧的版本时，请以**当前最新版本号**为 `baseVersionNo` 发布，否则同样收到 409。
+
 ### 两名编辑者并发修改（版本冲突）
 
 发布请求必须带 `baseVersionNo`（编辑台打开时自动记录当前最新版本号）。若两名编辑者都从第 N 版开始改，第一人发布产生第 N+1 版后，第二人仍以 `baseVersionNo=N` 提交时：
@@ -109,14 +129,15 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 ```
 src/
   server.js     Express 入口、口令中间件、静态界面
-  routes.js     公开只读 API 与编辑者草稿/发布 API
-  db.js         SQLite 连接与建表（草稿区 + 版本快照区）
+  routes.js     公开只读 API 与编辑者草稿/发布/恢复 API
+  db.js         SQLite 连接与建表（草稿区 + 草稿修订号触发器 + 版本快照区）
   dates.js      年/月/日精度 → 覆盖区间（公历序数日）
   solver.js     Tarjan 环检测 + 拓扑下界传播求严格先后可行解
   publish.js    发布事务：再校验 + 版本冲突检查 + 写不可变快照
+  restore.js    恢复草稿：只读预览 + 原子替换事务（修订号/版本号冲突检查、按快照重建）
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突）
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复）
 ```
 
 ## 主要 HTTP API
@@ -128,7 +149,7 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
 
 编辑（需请求头 `X-Editor-Token`）：
 
-- `GET  /api/editor/state` — 草稿全貌 + 当前版本号
+- `GET  /api/editor/state` — 草稿全貌 + 当前版本号 + 草稿修订号 `draftRevisionNo`
 - 事件：`POST /api/editor/events`、`PUT/DELETE /api/editor/events/:id`
 - 主张：`POST /api/editor/events/:id/claims`、`PUT/DELETE /api/editor/claims/:claimId`
 - 关系：`POST /api/editor/relations`、`DELETE /api/editor/relations/:id`
@@ -136,3 +157,7 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
 - `POST /api/editor/publish` — 发布；体含 `selection:[{eventId,claimId}]`、`baseVersionNo`、`editor`、`note`
   - 422：`{errors:[{type:missing|cycle|temporal, eventIds, relationIds, message, detail}]}`
   - 409：`{code:"VERSION_CONFLICT", baseVersionNo, currentVersionNo, currentVersion}`
+- `GET  /api/editor/restore-preview/:no` — 从第 `:no` 版恢复草稿的只读预览（该版被选内容 + 将被替换的当前草稿），返回 `draftRevisionNo`、`currentVersionNo`；版本不存在 404
+- `POST /api/editor/restore` — 确认恢复；体含 `versionNo`、`draftRevisionNo`、`currentVersionNo`（后两者取预览返回值）
+  - 200：`{restoredFromVersionNo, currentVersionNo, revisionNo, idMap:{events,relations}, pendingSelection:[{eventId,claimId}], draft}`
+  - 409：`{code:"DRAFT_REVISION_CONFLICT"|"VERSION_CONFLICT", ...}`（草稿或最新版本在确认前变化，数据不变）；版本不存在 404；参数非法 400

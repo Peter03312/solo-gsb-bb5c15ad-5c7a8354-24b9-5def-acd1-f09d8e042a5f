@@ -28,9 +28,10 @@ const store = {
   clearSelections() { localStorage.removeItem('selections'); },
 };
 
-let state = { events: [], relations: [], currentVersionNo: 0 };
+let state = { events: [], relations: [], currentVersionNo: 0, draftRevisionNo: 0 };
 let baseVersionNo = 0; // 发起修改时所基于的版本号
 let conflictData = null;
+let restorePreview = null; // 恢复草稿预览（确认时提交其中的修订号/最新版本号）
 
 async function api(method, url, body) {
   const res = await fetch(url, {
@@ -194,8 +195,11 @@ async function loadVersions() {
   $('#versionList').innerHTML = data.versions.length
     ? data.versions.map((v) => `
         <div class="rel-line">
-          <strong>第 ${v.versionNo} 版</strong>
-          <span class="muted">${v.publishedAt.replace('T', ' ').slice(0, 16)} UTC · ${esc(v.editor || '匿名')}${v.parentNo ? ` · 基于第 ${v.parentNo} 版` : ''}</span>
+          <div class="row" style="align-items:center">
+            <strong>第 ${v.versionNo} 版</strong>
+            <span class="muted" style="flex:1">${v.publishedAt.replace('T', ' ').slice(0, 16)} UTC · ${esc(v.editor || '匿名')}${v.parentNo ? ` · 基于第 ${v.parentNo} 版` : ''}</span>
+            <button class="secondary" type="button" data-restore-version="${v.versionNo}" style="padding:2px 10px;font-size:13px">预览并恢复草稿</button>
+          </div>
           ${v.note ? `<div>${esc(v.note)}</div>` : ''}
           <div><a href="/api/public/versions/${v.versionNo}" target="_blank">查看该版快照 JSON</a></div>
         </div>`).join('')
@@ -306,6 +310,136 @@ function showConflictDialog(body) {
   $('#conflictDialog').showModal();
 }
 
+// ---------- 从历史版本恢复草稿 ----------
+async function openRestorePreview(versionNo) {
+  $('#restoreBody').innerHTML = '加载预览中…（只读，不修改草稿）';
+  $('#restoreConfirm').disabled = false;
+  $('#restoreDialog').showModal();
+  restorePreview = null;
+  try {
+    const data = await api('GET', `/api/editor/restore-preview/${versionNo}`);
+    restorePreview = data;
+    renderRestorePreview(data);
+  } catch (err) {
+    if (err.message === 'unauthorized') {
+      $('#restoreDialog').close();
+      return;
+    }
+    $('#restoreBody').innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+    $('#restoreConfirm').disabled = true;
+  }
+}
+
+function restoreEventListHtml(events) {
+  if (!events.length) return '<p class="muted">（无事件）</p>';
+  return events.map((ev) => `
+    <div class="rel-line">
+      <strong>${esc(ev.title)}</strong>
+      <span class="badge prec">${esc(ev.dateLabel)}</span>
+      <span class="badge">区间 ${ev.intervalStart} ~ ${ev.intervalEnd}</span>
+      <div class="source"><b>出处：</b>${esc(ev.source || '（未注明）')}</div>
+      ${ev.claimNote ? `<div class="muted">${esc(ev.claimNote)}</div>` : ''}
+      ${ev.description ? `<div class="muted">${esc(ev.description)}</div>` : ''}
+    </div>`).join('');
+}
+
+function draftEventListHtml(events) {
+  if (!events.length) return '<p class="muted">（草稿为空）</p>';
+  return events.map((ev) => `
+    <div class="rel-line">
+      <strong>${esc(ev.title)}</strong>
+      <span class="badge">主张 ${ev.claims.length} 条</span>
+      ${ev.description ? `<div class="muted">${esc(ev.description)}</div>` : ''}
+    </div>`).join('');
+}
+
+function restoreRelationListHtml(version) {
+  const titleByEvent = new Map(version.events.map((e) => [e.eventId, e.title]));
+  if (!version.relations.length) return '<p class="muted">（无先后关系）</p>';
+  return version.relations.map((r) => `
+    <div class="rel-line">
+      <strong>${esc(titleByEvent.get(r.earlierEventId) || '#' + r.earlierEventId)}</strong>
+      <span class="badge">先于</span>
+      <strong>${esc(titleByEvent.get(r.laterEventId) || '#' + r.laterEventId)}</strong>
+      ${r.source ? `<div class="source"><b>出处：</b>${esc(r.source)}</div>` : ''}
+    </div>`).join('');
+}
+
+function draftRelationListHtml(relations, events) {
+  const titleById = new Map(events.map((e) => [e.id, e.title]));
+  if (!relations.length) return '<p class="muted">（无先后关系）</p>';
+  return relations.map((r) => `
+    <div class="rel-line">
+      <strong>${esc(titleById.get(r.earlierId) || '#' + r.earlierId)}</strong>
+      <span class="badge">先于</span>
+      <strong>${esc(titleById.get(r.laterId) || '#' + r.laterId)}</strong>
+    </div>`).join('');
+}
+
+function renderRestorePreview(data) {
+  const v = data.version;
+  const d = data.currentDraft;
+  $('#restoreBody').innerHTML = `
+    <p>将从 <b>第 ${data.versionNo} 版</b>（${v.eventCount} 个事件、${v.relationCount} 条关系）恢复草稿。
+       确认后会<b>原子替换整个当前草稿</b>：当前草稿的 ${d.counts.eventCount} 个事件、${d.counts.claimCount} 条主张、
+       ${d.counts.relationCount} 条关系将全部移除，按快照重建，且每个事件<b>只恢复该版被选的那一条主张</b>
+       （其余未选主张不会回来）。</p>
+    <p class="muted">历史快照与访客年表保持不变；恢复仅替换草稿，仍需重新校验、发布才会公开。
+       发布时沿用现有口令、校验规则与 baseVersionNo 约定（当前最新仍为第 ${data.currentVersionNo} 版）。</p>
+    <div class="grid2">
+      <div class="card" style="background:#fff;margin-bottom:0">
+        <h3>第 ${data.versionNo} 版将恢复的内容</h3>
+        <h3 style="font-size:13px">事件与被选主张</h3>
+        ${restoreEventListHtml(v.events)}
+        <h3 style="font-size:13px;margin-top:10px">「先于」关系</h3>
+        ${restoreRelationListHtml(v)}
+      </div>
+      <div class="card" style="background:#fff;margin-bottom:0">
+        <h3>当前草稿将被替换的内容</h3>
+        <h3 style="font-size:13px">事件（全部主张）</h3>
+        ${draftEventListHtml(d.events)}
+        <h3 style="font-size:13px;margin-top:10px">「先于」关系</h3>
+        ${draftRelationListHtml(d.relations, d.events)}
+      </div>
+    </div>
+    <p class="muted" style="margin-top:10px">预览基准：草稿修订号 ${data.draftRevisionNo} · 最新版本号 ${data.currentVersionNo}。
+       确认前若草稿或最新版本发生变化，将报冲突且不改动数据。</p>
+    <div id="restoreMsg"></div>`;
+}
+
+async function confirmRestore() {
+  if (!restorePreview) return;
+  const btn = $('#restoreConfirm');
+  btn.disabled = true;
+  try {
+    const data = await api('POST', '/api/editor/restore', {
+      versionNo: restorePreview.versionNo,
+      draftRevisionNo: restorePreview.draftRevisionNo,
+      currentVersionNo: restorePreview.currentVersionNo,
+    });
+    $('#restoreDialog').close();
+    // 用恢复后的待选主张替换本地单选；旧 id 已失效，不能保留
+    const m = {};
+    data.pendingSelection.forEach((s) => { m[s.eventId] = s.claimId; });
+    localStorage.setItem('selections', JSON.stringify(m));
+    await loadState();
+    showPublishResult('ok', `
+      草稿已从 <b>第 ${data.restoredFromVersionNo} 版</b>恢复（新草稿修订号 ${data.revisionNo}）。
+      每个事件仅带回该版被选主张且已替你选中。历史快照与访客年表未变，
+      请<b>校验能否发布</b>后再发布新版本；发布仍按 baseVersionNo = 第 ${data.currentVersionNo} 版做冲突检查。`);
+  } catch (err) {
+    if (err.message === 'unauthorized') { $('#restoreDialog').close(); return; }
+    if (err.status === 409) {
+      $('#restoreMsg').innerHTML = `<div class="alert error">${esc(err.message)}<br>
+        <span class="muted">数据未做任何改动。请关闭本框后重新点击「预览并恢复草稿」。</span></div>`;
+      btn.disabled = true;
+    } else {
+      $('#restoreMsg').innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+      btn.disabled = false;
+    }
+  }
+}
+
 // ---------- 事件委托：增删改 ----------
 async function onClick(e) {
   const t = e.target;
@@ -327,6 +461,11 @@ async function onClick(e) {
     showGlobal('warn', `已刷新到第 ${baseVersionNo} 版后的最新草稿。请重新确认各事件的主张选择，再点击发布。`);
     return;
   }
+
+  if (t.id === 'restoreCancel') { $('#restoreDialog').close(); restorePreview = null; return; }
+  if (t.id === 'restoreConfirm') return confirmRestore();
+  const restoreVersion = t.dataset && t.dataset.restoreVersion;
+  if (restoreVersion !== undefined) return openRestorePreview(Number(restoreVersion));
 
   const addEvent = t.dataset && t.dataset.addEvent !== undefined;
   if (t.id === 'btnAddEvent') {
