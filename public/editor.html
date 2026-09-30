@@ -91,6 +91,17 @@
     </div>
   </dialog>
 
+  <!-- 从历史版本恢复草稿对话框 -->
+  <dialog id="restoreDialog">
+    <div class="d-head" style="background:var(--paper);color:var(--accent-dark);border-bottom-color:var(--line)">↩ 从已发布版本恢复草稿（预览，尚未改数据）</div>
+    <div class="d-body" id="restoreBody">加载中…</div>
+    <div class="d-foot">
+      <button class="secondary" id="restoreCancel" type="button">取消</button>
+      <button id="refreshRestorePreview" type="button" class="secondary" hidden>重新预览</button>
+      <button id="restoreConfirm" type="button">确认恢复：整个草稿替换为该版</button>
+    </div>
+  </dialog>
+
   <script src="/editor.js"></script>
 </body>
 </html>

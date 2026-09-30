@@ -4,6 +4,7 @@ const express = require('express');
 const { getDb } = require('./db');
 const { parseClaimDate, claimInterval, formatClaimDate } = require('./dates');
 const { evaluateDraft, publishVersion, latestVersionNo, getVersionDetail, getVersionSummary } = require('./publish');
+const { previewRestore, confirmRestore, bumpDraftRevision, currentDraftRevision } = require('./restore');
 
 const router = express.Router();
 
@@ -33,6 +34,16 @@ function getEventOr404(id) {
   const ev = getDb().prepare('SELECT * FROM events WHERE id = ?').get(id);
   if (!ev) throw { status: 404, message: `事件 ${id} 不存在` };
   return ev;
+}
+
+// 草稿区任何增删改都在同一事务内推进一次修订号；中途抛错整体回滚。
+function draftMutate(fn) {
+  const db = getDb();
+  return db.transaction(() => {
+    const result = fn(db);
+    bumpDraftRevision(db);
+    return result;
+  })();
 }
 
 function claimRowToApi(c) {
@@ -130,6 +141,7 @@ router.get('/api/editor/state', (req, res) => {
   res.json({
     currentVersionNo: latestVersionNo(),
     currentVersion: getVersionSummary(latestVersionNo()) || null,
+    draftRevision: currentDraftRevision(),
     events,
     relations,
   });
@@ -139,8 +151,11 @@ router.get('/api/editor/state', (req, res) => {
 router.post('/api/editor/events', (req, res) => {
   const title = requireString(req.body, 'title', { max: 200 });
   const description = optionalString(req.body, 'description', 5000);
-  const info = getDb().prepare('INSERT INTO events (title, description) VALUES (?, ?)').run(title.trim(), description);
-  res.status(201).json({ event: eventRowToApi(getEventOr404(info.lastInsertRowid)) });
+  const event = draftMutate(() => {
+    const info = getDb().prepare('INSERT INTO events (title, description) VALUES (?, ?)').run(title.trim(), description);
+    return eventRowToApi(getEventOr404(info.lastInsertRowid));
+  });
+  res.status(201).json({ event, draftRevision: currentDraftRevision() });
 });
 
 router.put('/api/editor/events/:id', (req, res) => {
@@ -148,17 +163,22 @@ router.put('/api/editor/events/:id', (req, res) => {
   getEventOr404(id);
   const title = requireString(req.body, 'title', { max: 200 });
   const description = optionalString(req.body, 'description', 5000);
-  getDb()
-    .prepare('UPDATE events SET title = ?, description = ?, updated_at = datetime(\'now\') WHERE id = ?')
-    .run(title.trim(), description, id);
-  res.json({ event: eventRowToApi(getEventOr404(id)) });
+  const event = draftMutate(() => {
+    getDb()
+      .prepare('UPDATE events SET title = ?, description = ?, updated_at = datetime(\'now\') WHERE id = ?')
+      .run(title.trim(), description, id);
+    return eventRowToApi(getEventOr404(id));
+  });
+  res.json({ event, draftRevision: currentDraftRevision() });
 });
 
 router.delete('/api/editor/events/:id', (req, res) => {
   const id = Number(req.params.id);
   getEventOr404(id);
-  getDb().prepare('DELETE FROM events WHERE id = ?').run(id);
-  res.json({ deleted: id });
+  draftMutate(() => {
+    getDb().prepare('DELETE FROM events WHERE id = ?').run(id);
+  });
+  res.json({ deleted: id, draftRevision: currentDraftRevision() });
 });
 
 // ---- 主张 CRUD（同一事件允许矛盾主张并存） ----
@@ -166,14 +186,17 @@ router.post('/api/editor/events/:id/claims', (req, res) => {
   const eventId = Number(req.params.id);
   getEventOr404(eventId);
   const p = readClaimPayload(req.body);
-  const info = getDb()
-    .prepare(
-      `INSERT INTO claims
-         (event_id, precision, year, month, day, date_label, interval_start, interval_end, source, note)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(eventId, p.precision, p.year, p.month, p.day, p.dateLabel, p.intervalStart, p.intervalEnd, p.source, p.note);
-  res.status(201).json({ claim: claimRowToApi(getDb().prepare('SELECT * FROM claims WHERE id = ?').get(info.lastInsertRowid)) });
+  const claim = draftMutate(() => {
+    const info = getDb()
+      .prepare(
+        `INSERT INTO claims
+           (event_id, precision, year, month, day, date_label, interval_start, interval_end, source, note)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(eventId, p.precision, p.year, p.month, p.day, p.dateLabel, p.intervalStart, p.intervalEnd, p.source, p.note);
+    return claimRowToApi(getDb().prepare('SELECT * FROM claims WHERE id = ?').get(info.lastInsertRowid));
+  });
+  res.status(201).json({ claim, draftRevision: currentDraftRevision() });
 });
 
 router.put('/api/editor/claims/:claimId', (req, res) => {
@@ -181,21 +204,26 @@ router.put('/api/editor/claims/:claimId', (req, res) => {
   const existing = getDb().prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
   if (!existing) throw { status: 404, message: `主张 ${claimId} 不存在` };
   const p = readClaimPayload(req.body);
-  getDb()
-    .prepare(
-      `UPDATE claims SET precision=?, year=?, month=?, day=?, date_label=?,
-         interval_start=?, interval_end=?, source=?, note=? WHERE id=?`
-    )
-    .run(p.precision, p.year, p.month, p.day, p.dateLabel, p.intervalStart, p.intervalEnd, p.source, p.note, claimId);
-  res.json({ claim: claimRowToApi(getDb().prepare('SELECT * FROM claims WHERE id = ?').get(claimId)) });
+  const claim = draftMutate(() => {
+    getDb()
+      .prepare(
+        `UPDATE claims SET precision=?, year=?, month=?, day=?, date_label=?,
+           interval_start=?, interval_end=?, source=?, note=? WHERE id=?`
+      )
+      .run(p.precision, p.year, p.month, p.day, p.dateLabel, p.intervalStart, p.intervalEnd, p.source, p.note, claimId);
+    return claimRowToApi(getDb().prepare('SELECT * FROM claims WHERE id = ?').get(claimId));
+  });
+  res.json({ claim, draftRevision: currentDraftRevision() });
 });
 
 router.delete('/api/editor/claims/:claimId', (req, res) => {
   const claimId = Number(req.params.claimId);
   const existing = getDb().prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
   if (!existing) throw { status: 404, message: `主张 ${claimId} 不存在` };
-  getDb().prepare('DELETE FROM claims WHERE id = ?').run(claimId);
-  res.json({ deleted: claimId });
+  draftMutate(() => {
+    getDb().prepare('DELETE FROM claims WHERE id = ?').run(claimId);
+  });
+  res.json({ deleted: claimId, draftRevision: currentDraftRevision() });
 });
 
 // ---- 关系 CRUD ----
@@ -210,21 +238,24 @@ router.post('/api/editor/relations', (req, res) => {
   getEventOr404(laterId);
   const source = optionalString(req.body, 'source', 1000);
   const note = optionalString(req.body, 'note', 2000);
-  const info = getDb()
-    .prepare('INSERT INTO relations (earlier_id, later_id, source, note) VALUES (?, ?, ?, ?)')
-    .run(earlierId, laterId, source, note);
-  const row = getDb().prepare('SELECT * FROM relations WHERE id = ?').get(info.lastInsertRowid);
-  res.status(201).json({
-    relation: { id: row.id, earlierId: row.earlier_id, laterId: row.later_id, source: row.source, note: row.note },
+  const relation = draftMutate(() => {
+    const info = getDb()
+      .prepare('INSERT INTO relations (earlier_id, later_id, source, note) VALUES (?, ?, ?, ?)')
+      .run(earlierId, laterId, source, note);
+    const row = getDb().prepare('SELECT * FROM relations WHERE id = ?').get(info.lastInsertRowid);
+    return { id: row.id, earlierId: row.earlier_id, laterId: row.later_id, source: row.source, note: row.note };
   });
+  res.status(201).json({ relation, draftRevision: currentDraftRevision() });
 });
 
 router.delete('/api/editor/relations/:id', (req, res) => {
   const id = Number(req.params.id);
   const row = getDb().prepare('SELECT * FROM relations WHERE id = ?').get(id);
   if (!row) throw { status: 404, message: `关系 ${id} 不存在` };
-  getDb().prepare('DELETE FROM relations WHERE id = ?').run(id);
-  res.json({ deleted: id });
+  draftMutate(() => {
+    getDb().prepare('DELETE FROM relations WHERE id = ?').run(id);
+  });
+  res.json({ deleted: id, draftRevision: currentDraftRevision() });
 });
 
 // ---- 发布前预检：不落库，返回求解错误或可行日期 ----
@@ -293,7 +324,40 @@ router.get('/api/editor/versions', (req, res) => {
          FROM versions ORDER BY version_no DESC`
     )
     .all();
-  res.json({ currentVersionNo: no, versions: rows });
+  res.json({ currentVersionNo: no, draftRevision: currentDraftRevision(), versions: rows });
+});
+
+// ---- 从任一已发布版本恢复草稿 ----
+// 预览：只读。列出该版事件、被选主张、「先于」关系，以及当前草稿中将被替换的内容。
+router.post('/api/editor/restore/preview', (req, res) => {
+  const versionNo = Number(req.body && req.body.versionNo);
+  if (!Number.isInteger(versionNo) || versionNo < 1) {
+    throw badRequest('versionNo 必须是已发布版本号（正整数）');
+  }
+  res.json({ ok: true, ...previewRestore(versionNo) });
+});
+
+// 确认：须提交预览时的草稿修订号 draftRevision 与最新版本号 latestVersionNo。
+// 原子替换整个草稿；草稿或最新版本在确认前变化 -> 409 且不改数据；版本不存在 -> 404。
+router.post('/api/editor/restore/confirm', (req, res) => {
+  const versionNo = Number(req.body && req.body.versionNo);
+  const draftRevision = Number(req.body && req.body.draftRevision);
+  const latestVersionNoSeen = Number(req.body && req.body.latestVersionNo);
+  if (!Number.isInteger(versionNo) || versionNo < 1) {
+    throw badRequest('versionNo 必须是已发布版本号（正整数）');
+  }
+  if (!Number.isInteger(draftRevision) || draftRevision < 0) {
+    throw badRequest('draftRevision 必须是预览时返回的草稿修订号（非负整数）');
+  }
+  if (!Number.isInteger(latestVersionNoSeen) || latestVersionNoSeen < 0) {
+    throw badRequest('latestVersionNo 必须是预览时返回的最新版本号（非负整数）');
+  }
+  const result = confirmRestore({
+    versionNo,
+    draftRevision,
+    latestVersionNo: latestVersionNoSeen,
+  });
+  res.json(result);
 });
 
 module.exports = router;

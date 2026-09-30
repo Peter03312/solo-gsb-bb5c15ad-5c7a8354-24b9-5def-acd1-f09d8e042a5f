@@ -94,6 +94,17 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 - **不会**静默覆盖对方版本；
 - 第二人需点击「刷新到最新版本并重新确认选择」，重新核对每个事件的主张单选后再发布。
 
+### 从任一已发布版本恢复草稿（预览 → 确认）
+
+改错了草稿、想回到历史某版重来时，可在编辑台「已发布版本」列表中对**任意一个版本**点「从此版恢复草稿…」：
+
+1. **预览（不改数据）**：弹窗列出该版的事件、每个事件**被选定**的主张（精度 / 区间 / 出处 / 考异 / 求解日期）与全部「先于」关系，同时列出当前草稿中**将被替换丢弃**的内容（事件、主张、关系数量与清单），并显示预览时的草稿修订号与最新版本号。
+2. **确认**：提交预览时拿到的草稿修订号与最新版本号。成功时在单个事务内**原子替换整个草稿**——清空现有事件 / 主张 / 关系，按快照重建，且**每个事件只恢复该版被选的 1 条主张**（同事件未入选的矛盾主张不恢复）；编辑台会自动把本地主张单选迁移到恢复后的新行，可直接继续「校验能否发布」与发布。
+3. **冲突保护**：从预览到确认之间，若草稿发生过任何增删改（草稿修订号变化）或期间发布了新版本（最新版本号变化），返回 **409 冲突且不改任何数据**，需重新预览；目标版本不存在返回 **404**。
+4. **不影响历史与访客**：`versions / version_events / version_relations` 快照表保持只追加、不可变；访客年表仍展示最新已发布版本。恢复只动草稿区，之后的正式发布仍照旧遵守编辑口令、发布校验与 `baseVersionNo` 冲突约定。
+
+草稿每次增删改（事件 / 主张 / 关系的新增、修改、删除）以及一次成功的恢复，都会把草稿修订号 +1；该修订号随 `GET /api/editor/state` 一并返回（`draftRevision`）。
+
 ### 访客（http://localhost:3000/）
 
 只渲染最新已发布版本：按系统确定的日期排列的时间线、每条事件所选主张的精度与出处、全部「先于」关系及其出处。草稿、未发布主张、未发布关系均不出现在任何公开接口中。尚无发布版本时仅显示「尚未发布」。
@@ -103,20 +114,22 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 - 单文件 SQLite 数据库：容器中位于 `/app/data/chronicle.db`（Docker 卷 `chronicle-data`），本机直跑位于 `./data/chronicle.db`。
 - 备份：停止写入后复制该 `.db` 文件即可（或使用 SQLite 的 `.backup` 命令）。
 - 历史版本表 `versions / version_events / version_relations` 只追加、不更新不删除，保证不可变。
+- 草稿修订号存于 `draft_meta.revision`：任何草稿增删改都 +1，恢复确认时据此做乐观并发校验。恢复操作只清空重建 `events / claims / relations` 三张草稿表，快照表不触碰。
 
 ## 目录结构
 
 ```
 src/
   server.js     Express 入口、口令中间件、静态界面
-  routes.js     公开只读 API 与编辑者草稿/发布 API
-  db.js         SQLite 连接与建表（草稿区 + 版本快照区）
+  routes.js     公开只读 API 与编辑者草稿/发布/恢复 API
+  db.js         SQLite 连接与建表（草稿区 + 版本快照区 + 草稿修订号）
   dates.js      年/月/日精度 → 覆盖区间（公历序数日）
   solver.js     Tarjan 环检测 + 拓扑下界传播求严格先后可行解
   publish.js    发布事务：再校验 + 版本冲突检查 + 写不可变快照
+  restore.js    恢复事务：预览只读 + 修订号/版本号双校验 + 原子重建草稿
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突）
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、恢复与冲突）
 ```
 
 ## 主要 HTTP API
@@ -128,11 +141,20 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
 
 编辑（需请求头 `X-Editor-Token`）：
 
-- `GET  /api/editor/state` — 草稿全貌 + 当前版本号
+- `GET  /api/editor/state` — 草稿全貌 + 当前版本号 + 草稿修订号 `draftRevision`
 - 事件：`POST /api/editor/events`、`PUT/DELETE /api/editor/events/:id`
 - 主张：`POST /api/editor/events/:id/claims`、`PUT/DELETE /api/editor/claims/:claimId`
 - 关系：`POST /api/editor/relations`、`DELETE /api/editor/relations/:id`
+  - 以上草稿增删改每次使 `draftRevision` +1，响应体也回传最新 `draftRevision`
 - `POST /api/editor/validate` — 预校验（不落库）
 - `POST /api/editor/publish` — 发布；体含 `selection:[{eventId,claimId}]`、`baseVersionNo`、`editor`、`note`
   - 422：`{errors:[{type:missing|cycle|temporal, eventIds, relationIds, message, detail}]}`
   - 409：`{code:"VERSION_CONFLICT", baseVersionNo, currentVersionNo, currentVersion}`
+- `POST /api/editor/restore/preview` — 预览从某版恢复（只读不改数据）；体含 `versionNo`
+  - 200：`{versionNo,currentVersionNo,draftRevision,version:{events,relations,…},draftToReplace:{events,relations}}`
+  - 404：版本不存在
+- `POST /api/editor/restore/confirm` — 确认恢复；体含 `versionNo`、预览时的 `draftRevision`、`latestVersionNo`
+  - 200：`{ok,versionNo,currentVersionNo,draftRevision,idMap:{events,claims,relations},selection:[{eventId,claimId,…}],events,relations}`
+    - `idMap` 为旧快照 id → 新草稿 id 的映射；`selection`（别名 `pendingSelection`）为恢复后每事件唯一待选主张；`events/relations` 为新草稿全貌
+  - 409：`{code:"DRAFT_REVISION_CONFLICT", previewDraftRevision, currentDraftRevision}`（草稿被改过）或 `{code:"VERSION_CONFLICT", baseVersionNo, currentVersionNo}`（期间发布了新版），均不改数据
+  - 404：版本不存在
